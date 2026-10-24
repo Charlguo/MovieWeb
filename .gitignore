@@ -2,3 +2,17 @@
 bin/
 obj/
 *.user
+
+# Secrets
+.env
+!.env.example
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Training data and model artifacts
+ScriptAgentService/data/
+ScriptAgentService/models/
+ScriptAgentService/archive.zip

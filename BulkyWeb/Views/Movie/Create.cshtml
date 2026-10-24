@@ -46,11 +46,12 @@
                     <input type="text" id="aiPrompt" class="form-control" placeholder="e.g. Write a tense scene where the hero defuses a bomb..." />
                     <button type="button" id="btnGenerateActual" class="btn btn-dark" onclick="generateScript()">Generate</button>
                 </div>
-                <small class="text-muted">This will use Llama 3 to write a script for you.</small>
+                <small class="text-muted">A team of AI agents (Story Architect, Screenwriter, Script Doctor and Editor, powered by Llama 3) will outline, write, review and polish your scene.</small>
             </div>
 
             @* The actual Script Textarea (User can edit the result) *@
             <textarea asp-for="MovieScript" class="form-control" rows="10" placeholder="Script will appear here..."></textarea>
+            <small id="aiGenreCheck" class="mt-1 p-0"></small>
             <span asp-validation-for="MovieScript" class="text-danger"></span>
         </div>
 
@@ -83,6 +84,8 @@
             var prompt = document.getElementById("aiPrompt").value;
             var title = document.getElementById("Title").value; // Matches asp-for="Title"
             var genre = document.getElementById("Genre").value; // Matches asp-for="Genre"
+            var description = document.getElementById("Description").value; // Matches asp-for="Description"
+            var genreCheckEl = document.getElementById("aiGenreCheck");
 
             // Get UI elements to show loading state
             var btn = document.getElementById("btnGenerateActual");
@@ -97,8 +100,9 @@
             // UI: Switch to Loading State
             var originalText = btn.innerText;
             btn.disabled = true;
-            btn.innerText = "Writing Script...";
-            textArea.placeholder = "The AI is writing your masterpiece... this may take a few seconds.";
+            btn.innerText = "Agents at work...";
+            textArea.placeholder = "The agents are outlining, drafting and reviewing your scene... this can take a minute.";
+            genreCheckEl.textContent = "";
 
             try {
                 // Send data to the server
@@ -110,7 +114,8 @@
                     body: JSON.stringify({
                         prompt: prompt,
                         title: title,
-                        genre: genre
+                        genre: genre,
+                        description: description
                     })
                 });
 
@@ -121,6 +126,7 @@
                 if (data.success) {
                     // Success! Typewriter effect (optional) or just paste it
                     textArea.value = data.script;
+                    showGenreCheck(genreCheckEl, data.genreCheck, data.revisions);
                 } else {
                     alert("Error: " + data.message);
                 }
@@ -133,6 +139,21 @@
                 btn.disabled = false;
                 btn.innerText = originalText;
             }
+        }
+
+        // 3. Show the PyTorch genre classifier's verdict on the final script
+        function showGenreCheck(el, check, revisions) {
+            if (!check) {
+                el.textContent = "";
+                return;
+            }
+            var text = "Genre classifier: reads as " + check.predicted + " (" + Math.round(check.confidence * 100) + "% confidence)";
+            if (check.matches === true) text += ", matches the requested genre";
+            if (check.matches === false) text += ", does not match the requested genre";
+            if (revisions > 0) text += " · revised " + revisions + "x for genre";
+
+            el.textContent = text;
+            el.className = "mt-1 p-0 " + (check.matches === false ? "text-warning" : "text-success");
         }
     </script>
 }

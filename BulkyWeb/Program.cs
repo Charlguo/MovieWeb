@@ -2,12 +2,21 @@ using Bulky.DataAccess.Data;
 
 using Microsoft.EntityFrameworkCore;
 
+// Load secrets from the repo-root .env into environment variables before configuration is built
+DotNetEnv.Env.TraversePath().Load();
+
 var builder = WebApplication.CreateBuilder(args);
 
 // Add services to the container.
 builder.Services.AddControllersWithViews();
 builder.Services.AddDbContext<ApplicationDbContext>(options=>
     options.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection")));
+
+builder.Services.AddHttpClient("ScriptAgent", client =>
+{
+    client.BaseAddress = new Uri(builder.Configuration["ScriptAgentService:BaseUrl"] ?? "http://localhost:8000/");
+    client.Timeout = TimeSpan.FromSeconds(builder.Configuration.GetValue("ScriptAgentService:TimeoutSeconds", 300));
+});
 
 var app = builder.Build();
 

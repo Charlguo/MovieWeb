@@ -1,7 +1,7 @@
 ﻿using Bulky.DataAccess.Data;
 using Bulky.Models;
 using Microsoft.AspNetCore.Mvc;
-using System.Text;
+using System.Net.Http.Json;
 using System.Text.Json;
 
 namespace BulkyWeb.Controllers
@@ -9,10 +9,21 @@ namespace BulkyWeb.Controllers
     public class MovieController : Controller
     {
         private readonly ApplicationDbContext _db;
+        private readonly IHttpClientFactory _httpClientFactory;
+        private readonly IConfiguration _config;
 
-        public MovieController(ApplicationDbContext db)
+        // The Python agent service uses snake_case JSON (FastAPI/Pydantic convention)
+        private static readonly JsonSerializerOptions AgentJsonOptions = new()
+        {
+            PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
+            PropertyNameCaseInsensitive = true
+        };
+
+        public MovieController(ApplicationDbContext db, IHttpClientFactory httpClientFactory, IConfiguration config)
         {
             _db = db;
+            _httpClientFactory = httpClientFactory;
+            _config = config;
         }
 
         public IActionResult Index()
@@ -98,87 +109,78 @@ namespace BulkyWeb.Controllers
         [HttpPost]
         public async Task<IActionResult> GenerateAiScript([FromBody] ScriptRequest request)
         {
-            // 1. Setup the "Hollywood" Prompt
-            string systemPrompt = @"You are an expert Hollywood Screenwriter. 
-    Strictly follow standard screenplay formatting:
-    - Start with a SLUGLINE (e.g., INT. LOCATION - DAY).
-    - Character names in CAPS.
-    - Clear, concise Action Lines.
-    - Realistic dialogue.
-    - No conversational filler.";
-
-            string userPrompt = $"Write a scene for a {request.Genre} movie titled '{request.Title}'. " +
-                                $"Scenario: {request.Prompt}";
-
-            // 2. Configure JSON to match Groq's requirements (camelCase)
-            var jsonOptions = new JsonSerializerOptions
+            if (string.IsNullOrWhiteSpace(request.Prompt))
             {
-                PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-                WriteIndented = true
-            };
+                return Json(new { success = false, message = "Please describe what should happen in the scene." });
+            }
 
-            // 3. Create the Payload
-            var payload = new
+            var client = _httpClientFactory.CreateClient("ScriptAgent");
+
+            // Sends the movie details to the CrewAI agent service (ScriptAgentService/)
+            using var message = new HttpRequestMessage(HttpMethod.Post, "generate")
             {
-                // FIX #1: Use a valid, non-deprecated model
-                model = "llama-3.3-70b-versatile",
-
-                messages = new[]
-                {
-            new { role = "system", content = systemPrompt },
-            new { role = "user", content = userPrompt }
-        },
-                temperature = 0.7,
-                max_tokens = 1000 // approx 2 pages of script
+                Content = JsonContent.Create(
+                    new { request.Title, request.Genre, request.Description, request.Prompt },
+                    options: AgentJsonOptions)
             };
-
-            // Serialize with the options 
-            string jsonPayload = JsonSerializer.Serialize(payload, jsonOptions);
-            var content = new StringContent(jsonPayload, Encoding.UTF8, "application/json");
-
-            // 4. Send the Request
-            // Replace this with your console.groq API key
-            var apiKey = "your-api-key";
-
-            using var client = new HttpClient();
-            client.DefaultRequestHeaders.Add("Authorization", $"Bearer {apiKey}");
+            message.Headers.Add("X-Api-Key", _config["SERVICE_API_KEY"]);
 
             try
             {
-                var response = await client.PostAsync("https://api.groq.com/openai/v1/chat/completions", content);
+                using var response = await client.SendAsync(message, HttpContext.RequestAborted);
 
-                if (response.IsSuccessStatusCode)
+                if (!response.IsSuccessStatusCode)
                 {
-                    var responseString = await response.Content.ReadAsStringAsync();
-                    using var doc = JsonDocument.Parse(responseString);
-
-                    string script = doc.RootElement
-                        .GetProperty("choices")[0]
-                        .GetProperty("message")
-                        .GetProperty("content")
-                        .GetString();
-
-                    return Json(new { success = true, script = script });
-                }
-                else
-                {
-                    // Debugging: Read the error message to know exactly what failed
                     var errorMsg = await response.Content.ReadAsStringAsync();
-                    return Json(new { success = false, message = $"Groq Error ({response.StatusCode}): {errorMsg}" });
+                    return Json(new { success = false, message = $"Agent service error ({(int)response.StatusCode}): {errorMsg}" });
                 }
+
+                var result = await response.Content.ReadFromJsonAsync<AgentScriptResponse>(AgentJsonOptions);
+
+                return Json(new
+                {
+                    success = true,
+                    script = result?.Script,
+                    revisions = result?.Revisions ?? 0,
+                    genreCheck = result?.GenreCheck
+                });
             }
-            catch (Exception ex)
+            catch (HttpRequestException)
             {
-                return Json(new { success = false, message = "Server Error: " + ex.Message });
+                return Json(new
+                {
+                    success = false,
+                    message = $"Could not reach the script agent service at {client.BaseAddress}. Is it running?"
+                });
+            }
+            catch (TaskCanceledException) when (!HttpContext.RequestAborted.IsCancellationRequested)
+            {
+                return Json(new { success = false, message = "The agents took too long to respond. Please try again." });
             }
         }
 
         // Helper class for the data coming from JavaScript
         public class ScriptRequest
         {
-            public string Prompt { get; set; }
-            public string Title { get; set; }
-            public string Genre { get; set; }
+            public string? Prompt { get; set; }
+            public string? Title { get; set; }
+            public string? Genre { get; set; }
+            public string? Description { get; set; }
+        }
+
+        public class AgentScriptResponse
+        {
+            public string Script { get; set; } = "";
+            public int Revisions { get; set; }
+            public GenreCheckResult? GenreCheck { get; set; }
+        }
+
+        public class GenreCheckResult
+        {
+            public List<string> Requested { get; set; } = new();
+            public string Predicted { get; set; } = "";
+            public double Confidence { get; set; }
+            public bool? Matches { get; set; }
         }
     }
 }
