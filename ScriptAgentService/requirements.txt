@@ -1,9 +1,7 @@
-# CPU build of PyTorch is enough for inference. For GPU training install from
-# https://pytorch.org/get-started/locally/ before the rest of this file.
-torch>=2.3
-transformers>=4.44
-scikit-learn>=1.5
-pandas>=2.2
+# Embeddings run through ONNX (fastembed). This service does not use PyTorch.
+fastembed>=0.4
+qdrant-client>=1.12
+tiktoken>=0.7
 
 # The litellm extra provides the groq/ model provider
 crewai[litellm]>=1.0

@@ -46,12 +46,12 @@
                     <input type="text" id="aiPrompt" class="form-control" placeholder="e.g. Write a tense scene where the hero defuses a bomb..." />
                     <button type="button" id="btnGenerateActual" class="btn btn-dark" onclick="generateScript()">Generate</button>
                 </div>
-                <small class="text-muted">A team of AI agents (Story Architect, Screenwriter, Script Doctor and Editor, powered by Llama 3) will outline, write, review and polish your scene.</small>
+                <small class="text-muted">Four agents (Story Architect, Screenwriter, Story Critic, and Editor) write the scene with Llama 3. They can use similar scripts already saved in your catalog as reference.</small>
             </div>
 
             @* The actual Script Textarea (User can edit the result) *@
             <textarea asp-for="MovieScript" class="form-control" rows="10" placeholder="Script will appear here..."></textarea>
-            <small id="aiGenreCheck" class="mt-1 p-0"></small>
+            <small id="aiSources" class="text-muted mt-1 p-0"></small>
             <span asp-validation-for="MovieScript" class="text-danger"></span>
         </div>
 
@@ -85,7 +85,7 @@
             var title = document.getElementById("Title").value; // Matches asp-for="Title"
             var genre = document.getElementById("Genre").value; // Matches asp-for="Genre"
             var description = document.getElementById("Description").value; // Matches asp-for="Description"
-            var genreCheckEl = document.getElementById("aiGenreCheck");
+            var sourcesEl = document.getElementById("aiSources");
 
             // Get UI elements to show loading state
             var btn = document.getElementById("btnGenerateActual");
@@ -102,7 +102,7 @@
             btn.disabled = true;
             btn.innerText = "Agents at work...";
             textArea.placeholder = "The agents are outlining, drafting and reviewing your scene... this can take a minute.";
-            genreCheckEl.textContent = "";
+            sourcesEl.textContent = "";
 
             try {
                 // Send data to the server
@@ -126,7 +126,7 @@
                 if (data.success) {
                     // Success! Typewriter effect (optional) or just paste it
                     textArea.value = data.script;
-                    showGenreCheck(genreCheckEl, data.genreCheck, data.revisions);
+                    showSources(sourcesEl, data.sources, data.contextTokens);
                 } else {
                     alert("Error: " + data.message);
                 }
@@ -141,19 +141,15 @@
             }
         }
 
-        // 3. Show the PyTorch genre classifier's verdict on the final script
-        function showGenreCheck(el, check, revisions) {
-            if (!check) {
-                el.textContent = "";
+        // 3. Name the catalog scripts that were retrieved into the prompt
+        function showSources(el, sources, contextTokens) {
+            if (!sources || sources.length === 0) {
+                el.textContent = "No similar scripts in the catalog yet. Save a movie and the next generation can use it as reference.";
                 return;
             }
-            var text = "Genre classifier: reads as " + check.predicted + " (" + Math.round(check.confidence * 100) + "% confidence)";
-            if (check.matches === true) text += ", matches the requested genre";
-            if (check.matches === false) text += ", does not match the requested genre";
-            if (revisions > 0) text += " · revised " + revisions + "x for genre";
-
-            el.textContent = text;
-            el.className = "mt-1 p-0 " + (check.matches === false ? "text-warning" : "text-success");
+            var titles = sources.map(function (source) { return source.title; }).join(", ");
+            el.textContent = "Referenced " + sources.length + " saved script" + (sources.length === 1 ? "" : "s") + ": " + titles
+                + " (" + (contextTokens || 0) + " tokens of catalog context).";
         }
     </script>
 }

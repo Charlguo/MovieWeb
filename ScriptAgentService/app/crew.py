@@ -1,22 +1,32 @@
 """Multi-agent screenwriting pipeline.
 
-Story Architect -> Screenwriter -> Script Doctor -> Final Draft Editor, run
-sequentially by CrewAI. After the crew finishes, the PyTorch genre classifier
-acts as a guardrail: if the final script doesn't read as the requested genre,
-the Screenwriter is sent back with the classifier's verdict as feedback.
+Story Architect, Screenwriter, Script Doctor, and Final Draft Editor run in
+order through CrewAI. Before they start, retrieval adds similar scenes from
+the catalog to the prompt. The agents are told to learn structure and tone
+from those scenes and not to copy them.
+
+Temperature is set per role. It controls how much the model varies the next
+token: lower is more repeatable, higher is more inventive.
 """
 
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from crewai import LLM, Agent, Crew, Process, Task
 
-from .genre_classifier import GenreCheck, get_classifier
 from .settings import settings
-from .tools import DraftStore, GenreCheckTool
+from .store import ScriptStore, build_context
 
 logger = logging.getLogger(__name__)
+
+# The critic should stay consistent. The writer is allowed to vary.
+TEMPERATURE = {
+    "architect": 0.6,
+    "writer": 0.8,
+    "doctor": 0.3,
+    "editor": 0.5,
+}
 
 SCREENPLAY_RULES = """Screenplay formatting rules:
 - Start with a SLUGLINE (e.g. INT. LOCATION - DAY).
@@ -25,16 +35,21 @@ SCREENPLAY_RULES = """Screenplay formatting rules:
 - Realistic, subtext-driven dialogue.
 - No commentary, headings, markdown or notes outside the screenplay itself."""
 
+REFERENCE_RULES = """Reference rules:
+- The catalog excerpts below are examples of structure and tone only.
+- Do not copy their plot, characters, or dialogue.
+- If no excerpts are listed, write from the pitch alone."""
+
 
 @dataclass
 class ScriptResult:
     script: str
-    revisions: int
-    genre_check: GenreCheck | None
+    sources: list[dict] = field(default_factory=list)
+    context_tokens: int = 0
 
 
-def _llm(temperature: float) -> LLM:
-    return LLM(model=settings.llm_model, api_key=settings.groq_api_key, temperature=temperature)
+def _llm(role: str) -> LLM:
+    return LLM(model=settings.llm_model, api_key=settings.groq_api_key, temperature=TEMPERATURE[role])
 
 
 def _clean(text: str) -> str:
@@ -43,7 +58,7 @@ def _clean(text: str) -> str:
     return fenced.group(1).strip() if fenced else text
 
 
-def _agents(genre_tool: GenreCheckTool | None) -> dict[str, Agent]:
+def _agents() -> dict[str, Agent]:
     common = dict(verbose=settings.crew_verbose, allow_delegation=False)
     return {
         "architect": Agent(
@@ -53,7 +68,7 @@ def _agents(genre_tool: GenreCheckTool | None) -> dict[str, Agent]:
                 "A veteran story editor who has broken story for studio features. You think in "
                 "beats, stakes and reversals, and you know the conventions of every genre."
             ),
-            llm=_llm(0.6),
+            llm=_llm("architect"),
             **common,
         ),
         "writer": Agent(
@@ -63,18 +78,17 @@ def _agents(genre_tool: GenreCheckTool | None) -> dict[str, Agent]:
                 "A WGA screenwriter known for sharp dialogue and economical action lines. "
                 "You write in industry-standard screenplay format."
             ),
-            llm=_llm(0.8),
+            llm=_llm("writer"),
             **common,
         ),
         "doctor": Agent(
-            role="Script Doctor",
+            role="Story Critic",
             goal="Find the specific weaknesses in a draft and give actionable notes to fix them.",
             backstory=(
-                "A sought-after script doctor. You check pacing, character voice, genre tone and "
-                "formatting, and you back up genre judgements with data when you can."
+                "A seasoned story analyst. You check pacing, character voice, genre tone and "
+                "formatting, and you flag any passage that copies a reference scene."
             ),
-            tools=[genre_tool] if genre_tool else [],
-            llm=_llm(0.3),
+            llm=_llm("doctor"),
             **common,
         ),
         "editor": Agent(
@@ -84,48 +98,70 @@ def _agents(genre_tool: GenreCheckTool | None) -> dict[str, Agent]:
                 "A meticulous showrunner's assistant who turns notes into a polished final draft "
                 "and never lets a formatting error through."
             ),
-            llm=_llm(0.5),
+            llm=_llm("editor"),
             **common,
         ),
     }
 
 
-def _run_crew(inputs: dict[str, str], classifier) -> str:
-    store = DraftStore()
-    genre_tool = GenreCheckTool(classifier, store) if classifier else None
-    agents = _agents(genre_tool)
+def _retrieve(store: ScriptStore, title: str, genre: str, description: str, prompt: str) -> tuple[str, list[dict], int]:
+    query = f"Title: {title}\nGenre: {genre}\nLogline: {description}\nScene: {prompt}"
+    try:
+        chunks = store.search(query)
+    except Exception:
+        logger.exception("Retrieval failed; generating without catalog context")
+        return "", [], 0
+    context, sources, used = build_context(chunks)
+    logger.info("Retrieved %s catalog chunks, %s tokens of context", len(chunks), used)
+    return context, sources, used
 
+
+def generate_script(
+    title: str,
+    genre: str | None,
+    description: str | None,
+    prompt: str,
+    store: ScriptStore | None = None,
+) -> ScriptResult:
+    if not settings.groq_api_key or settings.groq_api_key.startswith("your-"):
+        raise RuntimeError("GROQ_API_KEY is not set in .env")
+
+    store = store or ScriptStore()
+    safe_title = title or "Untitled"
+    safe_genre = genre or "unspecified genre"
+    safe_description = description or "not provided"
+    context, sources, context_tokens = _retrieve(store, safe_title, safe_genre, safe_description, prompt)
+    references = context or "No earlier scripts are in the catalog yet."
+
+    agents = _agents()
     outline = Task(
         description=(
             "Movie title: {title}\nGenre: {genre}\nLogline: {description}\n"
             "Scene request from the producer: {prompt}\n\n"
+            + REFERENCE_RULES
+            + "\n\nCatalog excerpts:\n{references}\n\n"
             "Break this scene into 5-8 beats. Identify the location and time of day, the "
-            "characters present, what each character wants, and the turn at the end of the scene. "
-            "Lean into the conventions of the genre."
+            "characters present, what each character wants, and the turn at the end of the scene."
         ),
         expected_output="A numbered beat outline, plus the slugline and a short character list.",
         agent=agents["architect"],
     )
     draft = Task(
         description=(
-            "Write the full scene for '{title}' ({genre}) from the outline.\n\n" + SCREENPLAY_RULES
+            "Write the full scene for '{title}' ({genre}) from the outline.\n\n"
+            + SCREENPLAY_RULES
+            + "\n\n"
+            + REFERENCE_RULES
         ),
         expected_output="The complete scene in screenplay format, about two pages long.",
         agent=agents["writer"],
         context=[outline],
-        callback=store.save,
-    )
-    review_steps = (
-        "First call the genre_classifier tool with requested_genre='{genre}' and factor its "
-        "verdict into your notes. "
-        if genre_tool
-        else ""
     )
     review = Task(
         description=(
-            "Review the draft of '{title}', a {genre} scene. "
-            + review_steps
-            + "Then give 3-6 specific notes covering genre tone, pacing, dialogue and formatting."
+            "Review the draft of '{title}', a {genre} scene. Give 3-6 specific notes covering "
+            "genre tone, pacing, dialogue and formatting. Call out anything copied from the "
+            "catalog excerpts."
         ),
         expected_output="A numbered list of concrete, actionable notes.",
         agent=agents["doctor"],
@@ -140,7 +176,6 @@ def _run_crew(inputs: dict[str, str], classifier) -> str:
         agent=agents["editor"],
         context=[draft, review],
     )
-
     crew = Crew(
         agents=list(agents.values()),
         tasks=[outline, draft, review, final],
@@ -148,46 +183,11 @@ def _run_crew(inputs: dict[str, str], classifier) -> str:
         max_rpm=settings.crew_max_rpm,
         verbose=settings.crew_verbose,
     )
-    return _clean(crew.kickoff(inputs=inputs).raw)
-
-
-def _revise_for_genre(inputs: dict[str, str], script: str, check: GenreCheck) -> str:
-    writer = _agents(None)["writer"]
-    task = Task(
-        description=(
-            "This scene for '{title}' is supposed to be {genre}, but a genre classifier says:\n"
-            "{verdict}\n\nRewrite it so it unmistakably reads as {genre}: adjust tone, stakes, "
-            "imagery and dialogue while keeping the story beats.\n\n" + SCREENPLAY_RULES
-            + "\n\nCurrent scene:\n{script}"
-        ),
-        expected_output="Only the revised screenplay text, with nothing before or after it.",
-        agent=writer,
-    )
-    crew = Crew(agents=[writer], tasks=[task], max_rpm=settings.crew_max_rpm,
-                verbose=settings.crew_verbose)
-    return _clean(crew.kickoff(inputs={**inputs, "script": script, "verdict": check.summary()}).raw)
-
-
-def generate_script(title: str, genre: str | None, description: str | None, prompt: str) -> ScriptResult:
-    if not settings.groq_api_key or settings.groq_api_key.startswith("your-"):
-        raise RuntimeError("GROQ_API_KEY is not set in .env")
-
-    inputs = {
-        "title": title or "Untitled",
-        "genre": genre or "unspecified genre",
-        "description": description or "not provided",
+    script = _clean(crew.kickoff(inputs={
+        "title": safe_title,
+        "genre": safe_genre,
+        "description": safe_description,
         "prompt": prompt,
-    }
-    classifier = get_classifier()
-
-    script = _run_crew(inputs, classifier)
-    check = classifier.check(script, genre) if classifier else None
-
-    revisions = 0
-    while check and check.matches is False and revisions < settings.max_genre_revisions:
-        logger.info("Genre mismatch (%s); revising.", check.summary())
-        script = _revise_for_genre(inputs, script, check)
-        check = classifier.check(script, genre)
-        revisions += 1
-
-    return ScriptResult(script=script, revisions=revisions, genre_check=check)
+        "references": references,
+    }).raw)
+    return ScriptResult(script=script, sources=sources, context_tokens=context_tokens)

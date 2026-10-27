@@ -39,7 +39,7 @@ namespace BulkyWeb.Controllers
         }
 
         [HttpPost]
-        public IActionResult Create(Movie obj)
+        public async Task<IActionResult> Create(Movie obj)
         {
             // Custom Validation: Prevent creating a movie with the same title and description
             if (obj.Title != null && obj.Title.ToLower() == obj.Description?.ToLower())
@@ -51,7 +51,10 @@ namespace BulkyWeb.Controllers
             {
                 _db.Movies.Add(obj);
                 _db.SaveChanges();
-                TempData["success"] = "Movie created successfully";
+                var indexed = await TryIndexAsync(obj);
+                TempData["success"] = indexed
+                    ? "Movie created successfully"
+                    : "Movie created, but it could not be added to the script catalog";
                 return RedirectToAction("Index");
             }
 
@@ -70,13 +73,16 @@ namespace BulkyWeb.Controllers
         }
 
         [HttpPost]
-        public IActionResult Edit(Movie obj)
+        public async Task<IActionResult> Edit(Movie obj)
         {
             if (ModelState.IsValid)
             {
                 _db.Movies.Update(obj);
                 _db.SaveChanges();
-                TempData["success"] = "Movie updated successfully";
+                var indexed = await TryIndexAsync(obj);
+                TempData["success"] = indexed
+                    ? "Movie updated successfully"
+                    : "Movie updated, but the script catalog could not be refreshed";
                 return RedirectToAction("Index");
             }
 
@@ -95,13 +101,14 @@ namespace BulkyWeb.Controllers
         }
 
         [HttpPost, ActionName("Delete")]
-        public IActionResult DeletePOST(int? id)
+        public async Task<IActionResult> DeletePOST(int? id)
         {
             Movie? obj = _db.Movies.Find(id);
             if (obj == null) return NotFound();
 
             _db.Movies.Remove(obj);
             _db.SaveChanges();
+            await TryRemoveIndexAsync(obj.Id);
             TempData["success"] = "Movie deleted successfully";
             return RedirectToAction("Index");
         }
@@ -141,8 +148,8 @@ namespace BulkyWeb.Controllers
                 {
                     success = true,
                     script = result?.Script,
-                    revisions = result?.Revisions ?? 0,
-                    genreCheck = result?.GenreCheck
+                    sources = result?.Sources ?? new List<CatalogSource>(),
+                    contextTokens = result?.ContextTokens ?? 0
                 });
             }
             catch (HttpRequestException)
@@ -171,16 +178,54 @@ namespace BulkyWeb.Controllers
         public class AgentScriptResponse
         {
             public string Script { get; set; } = "";
-            public int Revisions { get; set; }
-            public GenreCheckResult? GenreCheck { get; set; }
+            public List<CatalogSource> Sources { get; set; } = new();
+            public int ContextTokens { get; set; }
         }
 
-        public class GenreCheckResult
+        public class CatalogSource
         {
-            public List<string> Requested { get; set; } = new();
-            public string Predicted { get; set; } = "";
-            public double Confidence { get; set; }
-            public bool? Matches { get; set; }
+            public int MovieId { get; set; }
+            public string Title { get; set; } = "";
+            public string Genre { get; set; } = "";
+            public double Score { get; set; }
+        }
+
+        // Best-effort catalog updates. Saving the movie must succeed even when
+        // the agent service or the vector database is down.
+        private async Task<bool> TryIndexAsync(Movie movie)
+        {
+            using var message = new HttpRequestMessage(HttpMethod.Post, "index")
+            {
+                Content = JsonContent.Create(
+                    new { movie.Id, movie.Title, movie.Genre, movie.Description, Script = movie.MovieScript },
+                    options: AgentJsonOptions)
+            };
+            return await SendAgentAsync(message);
+        }
+
+        private async Task<bool> TryRemoveIndexAsync(int movieId)
+        {
+            using var message = new HttpRequestMessage(HttpMethod.Delete, $"index/{movieId}");
+            return await SendAgentAsync(message);
+        }
+
+        private async Task<bool> SendAgentAsync(HttpRequestMessage message)
+        {
+            var client = _httpClientFactory.CreateClient("ScriptAgent");
+            message.Headers.Add("X-Api-Key", _config["SERVICE_API_KEY"]);
+            try
+            {
+                using var response = await client.SendAsync(message);
+                return response.IsSuccessStatusCode;
+            }
+            catch (HttpRequestException)
+            {
+                return false;
+            }
+            catch (TaskCanceledException)
+            {
+                return false;
+            }
         }
     }
 }

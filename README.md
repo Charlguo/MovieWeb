@@ -1,6 +1,12 @@
-In MovieController.cs
+Copy `.env.example` to `.env` and set `GROQ_API_KEY` and `SERVICE_API_KEY`.
 
-replace var apiKey with your real api key from console.groq
+Start the vector database and the agent service:
+
+```
+docker compose up --build
+```
+
+The site reads both values from `.env`. Do not put the Groq key in source code.
 
 ### **Showcase:**
 

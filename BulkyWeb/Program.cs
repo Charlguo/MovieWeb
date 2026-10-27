@@ -2,8 +2,15 @@ using Bulky.DataAccess.Data;
 
 using Microsoft.EntityFrameworkCore;
 
-// Load secrets from the repo-root .env into environment variables before configuration is built
-DotNetEnv.Env.TraversePath().Load();
+// Local development reads secrets from the repo-root .env. Hosted environments
+// supply the same names as environment variables, and have no .env file.
+try
+{
+    DotNetEnv.Env.TraversePath().Load();
+}
+catch (FileNotFoundException)
+{
+}
 
 var builder = WebApplication.CreateBuilder(args);
 

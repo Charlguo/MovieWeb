@@ -12,7 +12,8 @@ obj/
 __pycache__/
 *.pyc
 
-# Training data and model artifacts
+# Local dataset, old classifier artifacts, and the embedding-model cache
 ScriptAgentService/data/
 ScriptAgentService/models/
 ScriptAgentService/archive.zip
+ScriptAgentService/.cache/
